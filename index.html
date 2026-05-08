@@ -3305,6 +3305,65 @@
       const onlyVoucher = voucherItems.filter((_,j)=>!usedVou.has(j));
       return { matched, nearMatches, onlyVat, onlyVoucher };
     }
+    // 扫描一张 sheet 的 标签-数值 配对 (右侧双列常见于远大表类结构：左说明、右数值)
+    // 返回 { voucherAmount, voucherTons, vatTotalLabel, inoutTonsLabel } · 没识别到则为 null
+    function xsExtractLabelValuePairs(aoa){
+      const out = { voucherAmount: null, voucherTons: null, vatTotalLabel: null, inoutTonsLabel: null,
+                    voucherAmountLabel: '', voucherTonsLabel: '' };
+      if(!aoa || !aoa.length) return out;
+      const isNumLike = (v) => {
+        if(v==null || v==='') return false;
+        const s = String(v).replace(/[,\s¥￥元万千吨tT吨%]/g,'');
+        if(!s) return false;
+        return isFinite(Number(s));
+      };
+      const toNum = (v) => Number(String(v).replace(/[,\s¥￥元%]/g,''));
+      // 匹配优先级：越明确的词越优先
+      const matchVoucherAmt = s => /凭证金额合计|凭证金额总[计额]|记账凭证金额|凭证总金额|凭证金额/.test(s);
+      const matchVoucherQty = s => /凭证.{0,3}(入库)?.{0,3}(数量|重量|吨数)/.test(s);
+      const matchVatLabel  = s => /发票金额合计|价税合计总[额计]|发票总金额/.test(s);
+      const matchInoutLabel = s => /入库总重|入库重量合计|入库吨数合计/.test(s);
+      // 扫描所有单元格，对每个字符串临单元格查右邻 (同行+1 列)、下邻 (下一行同列) 作为候选值
+      const rows = aoa.length, cols = aoa[0]?.length || 0;
+      const tryAssign = (label, val) => {
+        if(val==null) return;
+        const n = toNum(val);
+        if(!isFinite(n) || n<=0) return;
+        // 单位推断: label 里有 "千元/万元" 则翻倍 (仅金额变量)
+        let mul = 1;
+        if(/万元|万¥/.test(label)) mul = 1e4;
+        else if(/千元|千¥/.test(label)) mul = 1e3;
+        // 单位推断: label 里有 "公斤|kg" 则重量÷1000
+        let qmul = 1;
+        if(/公斤|kg|千克/i.test(label)) qmul = 1e-3;
+        if(matchVoucherAmt(label) && out.voucherAmount==null){
+          out.voucherAmount = n*mul; out.voucherAmountLabel = label;
+        } else if(matchVoucherQty(label) && out.voucherTons==null){
+          out.voucherTons = n*qmul; out.voucherTonsLabel = label;
+        } else if(matchVatLabel(label) && out.vatTotalLabel==null){
+          out.vatTotalLabel = n*mul;
+        } else if(matchInoutLabel(label) && out.inoutTonsLabel==null){
+          out.inoutTonsLabel = n*qmul;
+        }
+      };
+      for(let i=0;i<rows;i++){
+        const row = aoa[i] || [];
+        for(let j=0;j<row.length;j++){
+          const cell = row[j];
+          if(cell==null || cell==='' || isNumLike(cell)) continue;
+          const labelStr = String(cell).trim();
+          if(!labelStr || labelStr.length>30) continue;
+          // 候选 1: 右邻
+          const right = row[j+1];
+          if(isNumLike(right)) tryAssign(labelStr, right);
+          // 候选 2: 下邻
+          const below = aoa[i+1] && aoa[i+1][j];
+          if(below!=null && isNumLike(below)) tryAssign(labelStr, below);
+        }
+      }
+      return out;
+    }
+
     function xsRecollect(){
       // 主路径: 列宽表分析 + 角色聚合。同时保留旧的 row 采集供明细预览使用。
       XS.rows = [];
@@ -3351,6 +3410,19 @@
           if(ro.voucher.unitInfo) agg.voucherUnitInfos.push({ sheet:s.name, ...ro.voucher.unitInfo });
           if(ro.voucher.amount!=null){ agg.voucherAmount = (agg.voucherAmount==null?0:agg.voucherAmount) + ro.voucher.amount; agg.voucherHasData = true; agg.voucherCount += ro.voucher.count; if(ro.voucher.totalLabel!=null && typeof ro.voucher.totalLabel==='string') agg.voucherSourceLabels.push(ro.voucher.totalLabel); }
           if(ro.voucher.qty!=null){ agg.voucherQty = (agg.voucherQty==null?0:agg.voucherQty) + ro.voucher.qty; agg.voucherQtyHasData = true; }
+          // 标签-数值 提取 · 作为 凭证金额/凭证重量 的 fallback (列头检测不到 才允许 fallback)
+          const lvp = xsExtractLabelValuePairs(s.aoa);
+          if(lvp.voucherAmount!=null && !ro.voucher.amount){
+            agg.voucherAmount = (agg.voucherAmount==null?0:agg.voucherAmount) + lvp.voucherAmount;
+            agg.voucherHasData = true;
+            agg.voucherFromLabel = true;
+            if(lvp.voucherAmountLabel) agg.voucherSourceLabels.push(lvp.voucherAmountLabel);
+          }
+          if(lvp.voucherTons!=null && !ro.voucher.qty){
+            agg.voucherQty = (agg.voucherQty==null?0:agg.voucherQty) + lvp.voucherTons;
+            agg.voucherQtyHasData = true;
+            agg.voucherQtyFromLabel = true;
+          }
           if(ro.inout.tons!=null){ agg.inoutTons += ro.inout.tons; agg.inoutHasData = true; agg.inoutCount += ro.inout.count; }
           if(ro.inout.totalLabel!=null) agg.inoutFromTotalLabel += ro.inout.totalLabel;
           if(ro.inout.autoSummary){ agg.inoutAutoSummary = true; if(ro.inout.autoSource) agg.inoutAutoSources.push(ro.inout.autoSource); }
@@ -3665,17 +3737,8 @@
             <div class="nums"><span class="big">¥${xsFmt(m.amtMatch.vatTotal)}</span><span class="arr">↔</span><span class="big">¥${xsFmt(m.amtMatch.voucherAmt)}</span></div>
             ${alertA}
           </div>`);
-      } else if(!haveVoucherAmt && m.vatTotal!=null){
-        // 无凭证: 金额核对卡换为「等待凭证补充」软提示，突出实际单价
-        const p = price!=null ? '¥'+xsFmt(price,2)+' / 吨' : '—';
-        cards.insertAdjacentHTML('beforeend', `
-          <div class="match-card waiting">
-            <div class="mc-h"><h4>实际单价 · 发票总计 ÷ 入库总重</h4>
-              <span class="pill" style="background:#f1f5f9;color:#475569;border-color:#e2e8f0">等待凭证补充</span></div>
-            <div class="nums"><span class="big">¥${xsFmt(m.vatTotal)}</span><span class="arr">÷</span><span class="big">${m.inoutTotal!=null?xsFmt(m.inoutTotal,3)+' t':'—'}</span><span class="arr">=</span><span class="big">${p}</span></div>
-            <span class="small">本表未提供记账凭证，仅计算实际单价。补充凭证后会自动走金额/重量核对。</span>
-          </div>`);
       }
+      // 无凭证时 · 不显示「实际单价·等待凭证补充」卡 (用户明确要求：没凭证 = 不核对不显示差额)
       if(m.qtyMatch){
         const pass = m.qtyMatch.pass;
         const ddQ = describeDiff(m.qtyMatch.inoutTons, m.qtyMatch.voucherTons, 'qty');
