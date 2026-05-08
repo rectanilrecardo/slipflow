@@ -770,7 +770,7 @@
               <div class="card-head">
                 <div class="head-l">
                   <h3>人工复核签字</h3>
-                  <span class="desc">按顺序解锁 · 制单 → 复核 → 审批 · 仅本地存储，不上传服务器</span>
+                  <span class="desc">手写签名 · 仅本地存储，不上传服务器</span>
                 </div>
                 <div class="seg">
                   <button class="btn" id="xlsxSignExportBtn" type="button">导出签字记录 (JSON)</button>
@@ -1709,6 +1709,46 @@
     const num = v => { const n = Number(String(v||'').replace(/,/g,'').trim()); return isFinite(n) ? n : 0; };
     const fmtMoney = v => (Math.round(num(v)*100)/100).toFixed(2);
     const fmtTons  = v => (Math.round(num(v)*1000)/1000).toFixed(3);
+    // 差额清晰化: 给出语义文本 (谁多/相差多少%/严重等级)
+    // kind: 'amt' = 金额(¥), 'qty' = 重量(t)
+    // a = 发票/入库 (基准方), b = 凭证 (对手方)
+    function describeDiff(a, b, kind){
+      const diff = a - b;
+      const unit = kind==='amt' ? '¥' : '';
+      const suffix = kind==='amt' ? '' : ' t';
+      const fmt = kind==='amt' ? fmtMoney : fmtTons;
+      const absDiff = Math.abs(diff);
+      const base = Math.max(Math.abs(a), Math.abs(b), 1e-9);
+      const pct = (absDiff / base) * 100;
+      const threshold = kind==='amt' ? 0.01 : 0.01;
+      const pass = absDiff <= threshold + 1e-9;
+      // 严重程度
+      let level = 'ok';      // 通过
+      if(!pass){
+        if(pct < 0.5)        level = 'minor';   // <0.5% 轻微
+        else if(pct < 5)     level = 'moderate'; // 0.5-5% 一般
+        else                 level = 'severe';   // ≥5% 严重
+      }
+      // 方向语义
+      let direction = '';
+      if(pass){
+        direction = '一致';
+      } else if(diff > 0){
+        // a 多于 b
+        direction = (kind==='amt')
+          ? `发票多 ${unit}${fmt(absDiff)}${suffix}`
+          : `入库多 ${fmt(absDiff)}${suffix}`;
+      } else {
+        direction = (kind==='amt')
+          ? `凭证多 ${unit}${fmt(absDiff)}${suffix}`
+          : `凭证多 ${fmt(absDiff)}${suffix}`;
+      }
+      const pctStr = pass ? '' : `相当于 ${pct < 0.01 ? '<0.01' : pct.toFixed(pct<1?2:1)}%`;
+      // 等级标签
+      const levelLabel = ({ok:'通过', minor:'轻微差异', moderate:'差异', severe:'严重差异'})[level];
+      const levelColor = ({ok:'#16a34a', minor:'#d97706', moderate:'#ea580c', severe:'#dc2626'})[level];
+      return { diff, absDiff, pct, pass, level, levelLabel, levelColor, direction, pctStr };
+    }
 
     // 重算核对: 渲染 vat/inout/voucher 明细 + 计算 amtMatch / qtyMatch + 汇总
     function recomputeMatching(){
@@ -1792,13 +1832,19 @@
         const diff = diffCents / 100;
         const pass = Math.abs(diffCents) <= 1;  // ±0.01 元 = ±1 分
         amtMatch = { vatTotal, voucherAmt, diff, pass };
+        const dd = describeDiff(vatTotal, voucherAmt, 'amt');
+        const alertBox = dd.pass
+          ? `<div style="margin-top:var(--space-2);padding:.55rem .7rem;border-radius:6px;background:#f0fdf4;border-left:3px solid #16a34a;font-size:.85rem">
+               <b style="color:#16a34a">✓ 金额核对通过</b> &nbsp;<span style="opacity:.75">差额 ¥${fmtMoney(diff)} 在阈值 ±¥0.01 内</span>
+             </div>`
+          : `<div style="margin-top:var(--space-2);padding:.55rem .7rem;border-radius:6px;background:${dd.level==='severe'?'#fef2f2':dd.level==='moderate'?'#fff7ed':'#fefce8'};border-left:3px solid ${dd.levelColor};font-size:.85rem">
+               <b style="color:${dd.levelColor}">⚠ ${dd.levelLabel}：${dd.direction}</b>
+               <div style="margin-top:.25rem;opacity:.78;font-size:.78rem">原始差额 ¥${fmtMoney(diff)}（${dd.pctStr}，阈值 ±¥0.01）</div>
+             </div>`;
         els.matchAmtBody.innerHTML = `
           <div>发票价税合计 (∑VAT): <b>¥${fmtMoney(vatTotal)}</b></div>
           <div>凭证金额 (∑voucher): <b>¥${fmtMoney(voucherAmt)}</b></div>
-          <div>偏差: <b>¥${fmtMoney(diff)}</b> (阈值 ±¥0.01)</div>
-          <div style="margin-top:var(--space-2)">
-            <span class="pill ${pass?'good':'bad'}">${pass?'✓ 金额核对通过':'✗ 金额核对不通过'}</span>
-          </div>`;
+          ${alertBox}`;
         els.matchAmtCard.style.display = '';
       } else {
         els.matchAmtBody.innerHTML = '<span class="small">暂无可核对数据 (需同时有 增值税发票 与 记账凭证)</span>';
@@ -1826,13 +1872,19 @@
         const diff = diffG / 1e6;
         const pass = Math.abs(diffG) <= 1e4;
         qtyMatch = { inoutTons, voucherTons: compareTo, voucherAllNorm, diff, pass };
+        const ddq = describeDiff(inoutTons, compareTo, 'qty');
+        const alertBoxQ = ddq.pass
+          ? `<div style="margin-top:var(--space-2);padding:.55rem .7rem;border-radius:6px;background:#f0fdf4;border-left:3px solid #16a34a;font-size:.85rem">
+               <b style="color:#16a34a">✓ 数量核对通过</b> &nbsp;<span style="opacity:.75">差额 ${fmtTons(diff)} t 在阈值 ±0.01 t 内</span>
+             </div>`
+          : `<div style="margin-top:var(--space-2);padding:.55rem .7rem;border-radius:6px;background:${ddq.level==='severe'?'#fef2f2':ddq.level==='moderate'?'#fff7ed':'#fefce8'};border-left:3px solid ${ddq.levelColor};font-size:.85rem">
+               <b style="color:${ddq.levelColor}">⚠ ${ddq.levelLabel}：${ddq.direction}</b>
+               <div style="margin-top:.25rem;opacity:.78;font-size:.78rem">原始差额 ${fmtTons(diff)} t（${ddq.pctStr}，阈值 ±0.01 t）${voucherAllNorm?'':' · 凭证未归一到吨'}</div>
+             </div>`;
         els.matchQtyBody.innerHTML = `
           <div>入库总重 (∑inout, 吨): <b>${fmtTons(inoutTons)} t</b></div>
           <div>凭证数量 ${voucherAllNorm?'(已归一到吨)':'(原始值、未能归一)'} : <b>${fmtTons(compareTo)} ${voucherAllNorm?'t':''}</b></div>
-          <div>偏差: <b>${fmtTons(diff)}</b> (阈值 ±0.01)</div>
-          <div style="margin-top:var(--space-2)">
-            <span class="pill ${pass?'good':'bad'}">${pass?'✓ 数量核对通过':'✗ 数量核对不通过'}</span>
-          </div>`;
+          ${alertBoxQ}`;
         els.matchQtyCard.style.display = '';
       } else if(mode==='amt_only'){
         els.matchQtyBody.innerHTML = '<span class="small">未提供入库单，本次仅走金额核对。</span>';
@@ -3602,12 +3654,16 @@
 
       if(m.amtMatch){
         const pass = m.amtMatch.pass;
+        const ddA = describeDiff(m.amtMatch.vatTotal, m.amtMatch.voucherAmt, 'amt');
+        const alertA = pass
+          ? `<div style="margin-top:.5rem;padding:.5rem .65rem;border-radius:6px;background:#f0fdf4;border-left:3px solid #16a34a;font-size:.83rem"><b style="color:#16a34a">✓ 两者一致</b> &nbsp;<span style="opacity:.75">差额 ¥${xsFmt(m.amtMatch.diff)} 在阈值 ±¥0.01 内</span></div>`
+          : `<div style="margin-top:.5rem;padding:.5rem .65rem;border-radius:6px;background:${ddA.level==='severe'?'#fef2f2':ddA.level==='moderate'?'#fff7ed':'#fefce8'};border-left:3px solid ${ddA.levelColor};font-size:.83rem"><b style="color:${ddA.levelColor}">⚠ ${ddA.levelLabel}：${ddA.direction}</b><div style="margin-top:.2rem;opacity:.78;font-size:.75rem">原始差额 ¥${xsFmt(m.amtMatch.diff)}（${ddA.pctStr}，阈值 ±¥0.01）</div></div>`;
         cards.insertAdjacentHTML('beforeend', `
           <div class="match-card ${pass?'pass':'fail'}">
             <div class="mc-h"><h4>金额核对 · 发票总计 ↔ 凭证金额</h4>
-              <span class="pill ${pass?'good':'bad'}"><span class="dot"></span>${pass?'通过':'不一致'}</span></div>
-            <div class="nums"><span class="big">¥${xsFmt(m.amtMatch.vatTotal)}</span><span class="arr">↔</span><span class="big">¥${xsFmt(m.amtMatch.voucherAmt)}</span><span class="small">偏差 ¥${xsFmt(m.amtMatch.diff)}</span></div>
-            <span class="small">阈值 ±¥0.01。</span>
+              <span class="pill ${pass?'good':'bad'}"><span class="dot"></span>${pass?'通过':ddA.levelLabel}</span></div>
+            <div class="nums"><span class="big">¥${xsFmt(m.amtMatch.vatTotal)}</span><span class="arr">↔</span><span class="big">¥${xsFmt(m.amtMatch.voucherAmt)}</span></div>
+            ${alertA}
           </div>`);
       } else if(!haveVoucherAmt && m.vatTotal!=null){
         // 无凭证: 金额核对卡换为「等待凭证补充」软提示，突出实际单价
@@ -3622,12 +3678,16 @@
       }
       if(m.qtyMatch){
         const pass = m.qtyMatch.pass;
+        const ddQ = describeDiff(m.qtyMatch.inoutTons, m.qtyMatch.voucherTons, 'qty');
+        const alertQ = pass
+          ? `<div style="margin-top:.5rem;padding:.5rem .65rem;border-radius:6px;background:#f0fdf4;border-left:3px solid #16a34a;font-size:.83rem"><b style="color:#16a34a">✓ 两者一致</b> &nbsp;<span style="opacity:.75">差额 ${xsFmt(m.qtyMatch.diff,3)} t 在阈值 ±0.01 t 内</span></div>`
+          : `<div style="margin-top:.5rem;padding:.5rem .65rem;border-radius:6px;background:${ddQ.level==='severe'?'#fef2f2':ddQ.level==='moderate'?'#fff7ed':'#fefce8'};border-left:3px solid ${ddQ.levelColor};font-size:.83rem"><b style="color:${ddQ.levelColor}">⚠ ${ddQ.levelLabel}：${ddQ.direction}</b><div style="margin-top:.2rem;opacity:.78;font-size:.75rem">原始差额 ${xsFmt(m.qtyMatch.diff,3)} t（${ddQ.pctStr}，阈值 ±0.01 t）</div></div>`;
         cards.insertAdjacentHTML('beforeend', `
           <div class="match-card ${pass?'pass':'fail'}">
             <div class="mc-h"><h4>重量核对 · 入库总重 ↔ 凭证数量</h4>
-              <span class="pill ${pass?'good':'bad'}"><span class="dot"></span>${pass?'通过':'不一致'}</span></div>
-            <div class="nums"><span class="big">${xsFmt(m.qtyMatch.inoutTons,3)} t</span><span class="arr">↔</span><span class="big">${xsFmt(m.qtyMatch.voucherTons,3)} t</span><span class="small">偏差 ${xsFmt(m.qtyMatch.diff,3)} t</span></div>
-            <span class="small">仅当三件齐全时走重量核对。</span>
+              <span class="pill ${pass?'good':'bad'}"><span class="dot"></span>${pass?'通过':ddQ.levelLabel}</span></div>
+            <div class="nums"><span class="big">${xsFmt(m.qtyMatch.inoutTons,3)} t</span><span class="arr">↔</span><span class="big">${xsFmt(m.qtyMatch.voucherTons,3)} t</span></div>
+            ${alertQ}
           </div>`);
       }
       // 数据缺口报告 (列中有部分行缺失 → 按用户要求报告)
@@ -3664,15 +3724,26 @@
           html += '<thead><tr style="background:var(--color-surface-2)"><th style="padding:.4rem .6rem;text-align:left;border-bottom:1px solid var(--color-border)">供应商</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">发票合计</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">凭证合计</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">入库吨数</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">金额差额</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">重量差额</th><th style="padding:.4rem .6rem;text-align:center;border-bottom:1px solid var(--color-border)">状态</th></tr></thead><tbody>';
           for(const row of bs){
             const failAmt = !row.amtPass;
-            const rowStyle = (failAmt||!row.qtyPass) ? 'background:#fef2f2' : '';
+            // 金额差额语义化: 凭证为 0 时不参与对比
+            let amtCell;
+            if(!row.voucherTotal){
+              amtCell = '<span style="opacity:.55">—</span>';
+            } else if(failAmt){
+              const ddRow = describeDiff(row.vatTotal, row.voucherTotal, 'amt');
+              amtCell = `<div style="color:${ddRow.levelColor};font-weight:600;line-height:1.25">${ddRow.direction}</div><div style="font-size:.7rem;opacity:.7;font-weight:400">${ddRow.pctStr}</div>`;
+            } else {
+              amtCell = '<span style="color:#16a34a">✓ 一致</span>';
+            }
+            // 重量列仍需凭证重量列才能对比，当前依然 —
+            const rowStyle = failAmt ? 'background:#fef2f2' : '';
             html += `<tr style="${rowStyle}">`;
             html += `<td style="padding:.35rem .6rem;border-bottom:1px solid var(--color-border)">${escapeHtml(row.supplier)}</td>`;
             html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">¥${xsFmt(row.vatTotal)}</td>`;
             html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">${row.voucherTotal?'¥'+xsFmt(row.voucherTotal):'—'}</td>`;
             html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">${row.inoutTons?xsFmt(row.inoutTons,3)+' t':'—'}</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border);${failAmt?'color:#dc2626;font-weight:600':''}">¥${xsFmt(row.amtDiff)}</td>`;
+            html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">${amtCell}</td>`;
             html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">—</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:center;border-bottom:1px solid var(--color-border)"><span class="pill ${(failAmt||!row.qtyPass)?'bad':'good'}" style="font-size:.65rem"><span class="dot"></span>${(failAmt||!row.qtyPass)?'差异':'通过'}</span></td>`;
+            html += `<td style="padding:.35rem .6rem;text-align:center;border-bottom:1px solid var(--color-border)"><span class="pill ${failAmt?'bad':'good'}" style="font-size:.65rem"><span class="dot"></span>${failAmt?'差异':'通过'}</span></td>`;
             html += '</tr>';
           }
           html += '</tbody></table></div></div>';
@@ -3881,9 +3952,7 @@
     // ===================== 人工复核签字 =====================
     const SIGN_LS_KEY = 'slipflow_signatures_v1';
     const SIGN_ROLES = [
-      { key:'preparer', label:'制单人',  order:1 },
-      { key:'reviewer', label:'复核人',  order:2 },
-      { key:'approver', label:'审批人',  order:3 }
+      { key:'reviewer', label:'复核签字',  order:1 }
     ];
     function xsCurrentDataKey(){
       // 签字绑定到当前根据集的快照(文件名 · 合计) — 换了数据手动重新签字
@@ -3921,22 +3990,17 @@
       const { bucket } = xsCurrentSignBucket();
       let html = '';
       let allSigned = true;
-      let prevSigned = true;
       for(const r of SIGN_ROLES){
         const sig = bucket.signatures[r.key];
         const isSigned = !!(sig && sig.image);
-        const locked = !prevSigned;
         if(!isSigned) allSigned = false;
-        const cls = ['sign-card', locked?'locked':'', isSigned?'signed':''].filter(Boolean).join(' ');
+        const cls = ['sign-card', isSigned?'signed':''].filter(Boolean).join(' ');
         const conclusion = sig && sig.conclusion || 'pass';
         html += '<div class="'+cls+'" data-role="'+r.key+'">';
         html +=   '<div class="sign-h">';
         html +=     '<span class="role">'+escapeHtml(r.label)+'</span>';
-        html +=     '<span class="order">· 第 '+r.order+' 档</span>';
         if(isSigned){
           html += '<span class="badge-signed">✓ 已签字</span>';
-        } else if(locked){
-          html += '<span class="badge-locked">未解锁</span>';
         }
         html +=   '</div>';
         if(isSigned){
@@ -3959,7 +4023,6 @@
           html += '</div>';
         }
         html += '</div>';
-        prevSigned = isSigned && prevSigned;
       }
       body.innerHTML = html;
       // 摆 canvas
@@ -3987,17 +4050,19 @@
         });
       });
       // 汇总条
-      if(allSigned){
+      if(allSigned && summary){
         const sigs = bucket.signatures;
         const anyDoubt = SIGN_ROLES.some(r => (sigs[r.key]||{}).conclusion==='doubt');
+        const names = SIGN_ROLES.map(r=>escapeHtml((sigs[r.key]||{}).signer||'')).filter(Boolean).join(' / ');
+        const ts = (sigs[SIGN_ROLES[0].key]||{}).timestamp || '';
         summary.style.display='';
         summary.style.background = anyDoubt ? '#fef3c7' : '#f0fdf4';
         summary.style.borderColor = anyDoubt ? '#fde68a' : '#86efac';
         summary.style.color = anyDoubt ? '#92400e' : '#15803d';
         summary.textContent = anyDoubt
-          ? '三档复核已完成 · 但有疑义 · ' + SIGN_ROLES.map(r=>escapeHtml((sigs[r.key]||{}).signer||'')).filter(Boolean).join(' / ')
-          : '✓ 三档复核全部通过 · ' + SIGN_ROLES.map(r=>escapeHtml((sigs[r.key]||{}).signer||'')).filter(Boolean).join(' / ');
-      } else {
+          ? '复核已完成 · 有疑义 · 签字人：' + names + (ts?' · '+ts:'')
+          : '✓ 复核已通过 · 签字人：' + names + (ts?' · '+ts:'');
+      } else if(summary){
         summary.style.display='none';
       }
     }
@@ -4065,14 +4130,9 @@
       xsRenderSign();
     }
     function xsResetSign(roleKey){
-      if(!confirm('重置此档签字？该档以后的档也会一起重置。')) return;
+      if(!confirm('重新签字？当前签名将被清除。')) return;
       const { all, k, bucket } = xsCurrentSignBucket();
-      // 重置该档 + 之后所有档(维护顺序锁定)
-      let after = false;
-      for(const r of SIGN_ROLES){
-        if(r.key===roleKey) after = true;
-        if(after) delete bucket.signatures[r.key];
-      }
+      delete bucket.signatures[roleKey];
       all[k] = bucket;
       xsSaveSignState(all);
       xsRenderSign();
@@ -4088,7 +4148,7 @@
       setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
     }
     function xsClearCurrentSign(){
-      if(!confirm('清除本次根据集的全部签字？')) return;
+      if(!confirm('清除本次根据集的签字？')) return;
       const { all, k } = xsCurrentSignBucket();
       delete all[k];
       xsSaveSignState(all);
