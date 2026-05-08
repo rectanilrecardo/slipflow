@@ -715,8 +715,6 @@
                   <p>上传 Excel 后，这里会自动生成金额核对与重量核对结论（阈值 ±¥0.01）。</p>
                 </div>
               </div>
-              <div id="xlsxBySupplierPanel" style="display:none"></div>
-              <div id="xlsxPairingsPanel" style="display:none"></div>
             </div>
 
             <div class="card">
@@ -2388,9 +2386,7 @@
       books: [],          // [{file, sheets:[{name,detected,headerRow,rows,total,mapping,disabled}]}]
       rows: [],           // 跨表汇总的 rows (同 shape 于 state.rows)
       matching: null,
-      previewCat: 'vat_invoice',
-      unitOverrides: {},   // { 'sheetName::role': mul }  #3 单位人工覆盖
-      headerOverrides: {}  // { 'bookName::sheetName': rowIndex }  #4 表头返回覆盖
+      previewCat: 'vat_invoice'
     };
     // 字段同义词（按优先级）
     const XF_ALIASES = {
@@ -2473,39 +2469,9 @@
       return bs>=8 ? best : 'unknown';
     }
     // 在前 N 行中寻找表头行（带词最多的一行）
-    // 计算表头置信度分数 (0-100)
-    function xsHeaderRowScore(row, nextRow, aoa, rowIdx){
-      if(!row || !row.length) return 0;
-      const CJK_KEYWORDS = /发票|金额|供应商|日期|数量|单位|凭证号|摘要|重量|价税|开票|入库|编号|号码|名称|序号|合计/;
-      let strCount=0, cjkKwCount=0, numCount=0, totalCells=0;
-      for(const cell of row){
-        if(cell==null||cell==='') continue;
-        totalCells++;
-        if(typeof cell==='number'){ numCount++; continue; }
-        const s = String(cell).trim();
-        if(/^[\d.,\s%¥$]+$/.test(s)){ numCount++; continue; }
-        if(s.length<=20) strCount++;
-        if(CJK_KEYWORDS.test(s)) cjkKwCount++;
-      }
-      if(!totalCells) return 0;
-      let score = 0;
-      // 字符串单元格比例
-      score += Math.round((strCount / Math.max(totalCells,1)) * 30);
-      // 中文关键字数量 (每个+10，上限40)
-      score += Math.min(40, cjkKwCount * 10);
-      // 非纯数字行加分
-      if(numCount < totalCells * 0.3) score += 15;
-      // 下一行含大量数值 → 更像表头
-      if(nextRow){
-        const nextNums = (nextRow||[]).filter(c=>c!=null&&c!==''&&(typeof c==='number'||(typeof c==='string'&&/^[\d.,\s]+$/.test(String(c).trim()))));
-        if(nextNums.length >= 2) score += 15;
-      }
-      return Math.min(100, score);
-    }
     function xsFindHeaderRow(rows, lookahead=8){
       let best = -1, bestScore = -1;
       const checkN = Math.min(rows.length, lookahead);
-      const candidates = [];
       for(let i=0;i<checkN;i++){
         const row = rows[i] || [];
         let score = 0;
@@ -2524,13 +2490,8 @@
         }
         // 后面还得有数据行
         const hasData = (i+1<rows.length) && (rows[i+1]||[]).some(c=>c!=null && c!=='');
-        const confScore = xsHeaderRowScore(row, rows[i+1], rows, i);
-        const previewCells = (row||[]).slice(0,4).map(c=>String(c==null?'':c).trim()).filter(Boolean).join(' | ');
-        candidates.push({ row:i, score:confScore, preview: previewCells||('行'+(i+1)) });
         if(hasData && score>bestScore){ bestScore=score; best=i; }
       }
-      // 把 candidates 挂在函数对象上供 xsAnalyzeWideSheet 使用
-      xsFindHeaderRow._lastCandidates = candidates;
       return best>=0 ? best : 0;
     }
     function xsBuildMapping(headers){
@@ -2650,19 +2611,8 @@
     // 列宽表主引擎：输入 sheet aoa，产出 cols=[{idx,header,roles,values,labels,total,emptyCol,gaps}]
     function xsAnalyzeWideSheet(sheet){
       const aoa = sheet.aoa || [];
-      if(!aoa.length) return { headerRow:0, cols:[], rowCount:0, headerConfidence:0, headerCandidates:[] };
-      // 检查 headerOverrides
-      const overrideKey = (sheet._book||'') + '::' + (sheet.name||'');
-      let hi;
-      if(XS.headerOverrides && XS.headerOverrides[overrideKey] != null){
-        hi = XS.headerOverrides[overrideKey];
-        // 仍然计算 candidates 为渲染提供
-        xsFindHeaderRow(aoa);
-      } else {
-        hi = xsFindHeaderRow(aoa);
-      }
-      const candidates = xsFindHeaderRow._lastCandidates || [];
-      const headerConfidence = (candidates.find(c=>c.row===hi)||{score:50}).score;
+      if(!aoa.length) return { headerRow:0, cols:[], rowCount:0 };
+      const hi = xsFindHeaderRow(aoa);
       const headerRow = aoa[hi] || [];
       const ncols = Math.max(...aoa.map(r=>r.length||0), headerRow.length);
       const cols = [];
@@ -2773,7 +2723,7 @@
           // 部分行缺失 = values 不足 expectedRows
         });
       }
-      return { headerRow:hi, cols, rowCount: aoa.length - hi - 1, headerConfidence, headerCandidates: candidates };
+      return { headerRow:hi, cols, rowCount: aoa.length - hi - 1 };
     }
     // 从 cols 里汇总出三个角色的金额/重量总和、并制作数据缺口报告
     function xsAggregateRoles(sheetAnalysis, sheetMeta){
@@ -2825,13 +2775,6 @@
         if(role==='vat_amount'){
           // 单位检测: header 含「万元」/「千元」等 → 全列乘 multiplier
           const unitInfo = detectUnitForCol({ header: col.header, sampleUnits: [], fallbackDim:'amount' });
-          // #3: 单位覆盖检查
-          const _overrideKeyVat = (sheetMeta.name||'') + '::vat';
-          if(XS.unitOverrides && XS.unitOverrides[_overrideKeyVat] != null){
-            unitInfo.mul = XS.unitOverrides[_overrideKeyVat];
-            unitInfo.comparable = true;
-            unitInfo.overridden = true;
-          }
           const mul = unitInfo.mul || 1;
           const sum = col.numericValues.reduce((a,x)=>a+xsParseNumber(x.value)*mul, 0);
           if(col.numericValues.length>0){
@@ -2861,13 +2804,6 @@
         }
         if(role==='voucher_amount'){
           const unitInfo = detectUnitForCol({ header: col.header, sampleUnits: [], fallbackDim:'amount' });
-          // #3: 单位覆盖检查
-          const _overrideKeyVou = (sheetMeta.name||'') + '::voucher';
-          if(XS.unitOverrides && XS.unitOverrides[_overrideKeyVou] != null){
-            unitInfo.mul = XS.unitOverrides[_overrideKeyVou];
-            unitInfo.comparable = true;
-            unitInfo.overridden = true;
-          }
           const mul = unitInfo.mul || 1;
           const sum = col.numericValues.reduce((a,x)=>a+xsParseNumber(x.value)*mul, 0);
           if(col.numericValues.length>0){
@@ -2882,16 +2818,6 @@
           if(col.numericValues.length>0){ roles.voucher.qty = (roles.voucher.qty==null?sum:roles.voucher.qty+sum); roles.voucher.qtyCol = col.idx; }
         }
         // 路入 inout: 优先顺序 → inout_qty_t totalRow > inout_qty_kg totalRow/1000 > inout_qty_t 明细 sum > inout_qty_kg 明细 sum/1000
-        // #3: inout 单位覆盖
-        if((role==='inout_qty_t'||role==='inout_qty_kg'||role==='inout_qty') && !roles.inout._unitOverrideApplied){
-          const _overrideKeyInout = (sheetMeta.name||'') + '::inout';
-          if(XS.unitOverrides && XS.unitOverrides[_overrideKeyInout] != null){
-            if(!roles.inout.unitInfo) roles.inout.unitInfo = {};
-            roles.inout.unitInfo.mul = XS.unitOverrides[_overrideKeyInout];
-            roles.inout.unitInfo.overridden = true;
-            roles.inout._unitOverrideApplied = true;
-          }
-        }
         if(role==='inout_qty_t'){
           // totalRow (合计行本列数值)优先
           if(col.totalRows.length>0){
@@ -2968,72 +2894,7 @@
         roles.avgPrice.value = roles.vat.amount / roles.inout.tons;
         roles.avgPrice.autoSummary = true;
       }
-      // #1: 生成 lineItems 数组
-      const lineItems = [];
-      const supplierCol = cols.find(c=>c.primaryRole==='supplier');
-      const dateCol = cols.find(c=>c.primaryRole && /date/.test(c.primaryRole));
-      const sheetName = sheetMeta.name||'';
-      const bookName = sheetMeta._book||'';
-      const docType = sheetMeta.docType || 'unknown';
-      const isVatSheet = /vat_invoice/.test(docType) || /发票|専票|普票|增値税/.test(sheetName);
-      const isVoucherSheet = /voucher/.test(docType) || /凭证|记账/.test(sheetName);
-      const isInoutSheet = /inout/.test(docType) || /入库|采购|仓库|收货/.test(sheetName);
-      // VAT lineItems (skip voucher sheets to avoid misclassification)
-      if(!isVoucherSheet && roles.vat.fromCol!=null){
-        const vatAmtCol = cols.find(c=>c.idx===roles.vat.fromCol);
-        if(vatAmtCol){
-          const vatMul = (vatAmtCol && roles.vat.unitInfo && roles.vat.unitInfo.mul)||1;
-          for(const nv of vatAmtCol.numericValues){
-            const sup = supplierCol ? String((supplierCol.values.find(x=>x.row===nv.row)||{}).value||'').trim() : '';
-            const dt = dateCol ? String((dateCol.values.find(x=>x.row===nv.row)||{}).value||'') : '';
-            lineItems.push({ kind:'vat', supplier:sup||'(未指定)', date:dt, amount:xsParseNumber(nv.value)*vatMul, sheetName, bookName, rowIdx:nv.row, colIdx:vatAmtCol.idx, mul:vatMul });
-          }
-        }
-      }
-      // Voucher lineItems: prefer voucher_amount col, fallback on vat_amount col for voucher sheets
-      {
-        let vouCol = cols.find(c=>c.primaryRole==='voucher_amount' && c.numericValues.length>0);
-        if(!vouCol && isVoucherSheet){
-          // On voucher sheets, treat vat_amount-classified columns as voucher_amount
-          vouCol = cols.find(c=>c.primaryRole==='vat_amount' && c.numericValues.length>0);
-        }
-        if(vouCol && vouCol.numericValues.length>0){
-          const vouMul = (roles.voucher.unitInfo && roles.voucher.unitInfo.mul) || (roles.vat.unitInfo && roles.vat.unitInfo.mul) || 1;
-          for(const nv of vouCol.numericValues){
-            const sup = supplierCol ? String((supplierCol.values.find(x=>x.row===nv.row)||{}).value||'').trim() : '';
-            const dt = dateCol ? String((dateCol.values.find(x=>x.row===nv.row)||{}).value||'') : '';
-            lineItems.push({ kind:'voucher', supplier:sup||'(未指定)', date:dt, amount:xsParseNumber(nv.value)*vouMul, sheetName, bookName, rowIdx:nv.row, colIdx:vouCol.idx, mul:vouMul });
-          }
-        } else if(roles.voucher.amount!=null && roles.voucher.fromCol!=null && !isVoucherSheet){
-          // 凭证是合计标签读出（跨 sheet 场景），记录为汇总条目
-          lineItems.push({ kind:'voucher', supplier:'(未指定)', date:'', amount:roles.voucher.amount, sheetName, bookName, rowIdx:-1, colIdx:roles.voucher.fromCol, mul:1, isSummary:true });
-        }
-      }
-      // Inout lineItems (skip pure voucher sheets unless they have clear inout columns)
-      const inoutTCol = cols.find(c=>c.primaryRole==='inout_qty_t' && c.idx===roles.inout.fromCol);
-      const inoutKgCol = cols.find(c=>c.primaryRole==='inout_qty_kg' && c.idx===roles.inout.fromCol);
-      const inoutQtyCol = !isVoucherSheet ? cols.find(c=>c.primaryRole==='inout_qty' && c.idx===roles.inout.fromCol) : null;
-      const inoutUnitCol = cols.find(c=>c.primaryRole==='inout_unit');
-      const inoutSrcCol = inoutTCol || inoutKgCol || inoutQtyCol;
-      if(inoutSrcCol && !isVoucherSheet){
-        for(const nv of inoutSrcCol.numericValues){
-          const sup = supplierCol ? String((supplierCol.values.find(x=>x.row===nv.row)||{}).value||'').trim() : '';
-          const dt = dateCol ? String((dateCol.values.find(x=>x.row===nv.row)||{}).value||'') : '';
-          const raw = xsParseNumber(nv.value);
-          let tons = null;
-          if(inoutTCol) tons = raw;
-          else if(inoutKgCol) tons = raw/1000;
-          else if(inoutQtyCol){
-            const u = inoutUnitCol ? String((inoutUnitCol.values.find(x=>x.row===nv.row)||{}).value||'') : '';
-            const w = normalizeWeight(String(raw), u);
-            tons = (w && w.tons!=null) ? w.tons : null;
-          }
-          lineItems.push({ kind:'inout', supplier:sup||'(未指定)', date:dt, tons, qtyRaw:String(raw), unitRaw:inoutTCol?'t':inoutKgCol?'kg':'', sheetName, bookName, rowIdx:nv.row, colIdx:inoutSrcCol.idx, mul:1 });
-        }
-      }
-      delete roles.inout._unitOverrideApplied;
-      return { roles, gaps, skipped, colsRendered, supplier: supplierVals[0]||'', supplierAll:supplierVals, detailRows: totalDetailRows, lineItems,
-        headerRow: sheetAnalysis.headerRow, headerConfidence: sheetAnalysis.headerConfidence, headerCandidates: sheetAnalysis.headerCandidates };
+      return { roles, gaps, skipped, colsRendered, supplier: supplierVals[0]||'', supplierAll:supplierVals, detailRows: totalDetailRows };
     }
 
     function xsRowsFromSheet(sheet, docTypeOverride){
@@ -3168,47 +3029,6 @@
       }
       return { fileName:file.name, sheets };
     }
-    // #2: 逐行配对建议
-    function xsBuildPairings(vatItems, voucherItems){
-      const supplierCompat = (a, b) => !a || !b || a==='(未指定)' || b==='(未指定)' || a.trim()===b.trim();
-      const usedVat = new Set(), usedVou = new Set();
-      const matched = [], nearMatches = [];
-      // 完全配对: cents 相等 + supplier 兼容
-      for(let i=0;i<vatItems.length;i++){
-        if(usedVat.has(i)) continue;
-        const v = vatItems[i];
-        const vCents = Math.round((v.amount||0)*100);
-        for(let j=0;j<voucherItems.length;j++){
-          if(usedVou.has(j)) continue;
-          const w = voucherItems[j];
-          if(w.isSummary) continue; // 汇总条目跳过
-          const wCents = Math.round((w.amount||0)*100);
-          if(vCents===wCents && supplierCompat(v.supplier, w.supplier)){
-            matched.push({ vat:v, voucher:w, reason:'金额相等' });
-            usedVat.add(i); usedVou.add(j); break;
-          }
-        }
-      }
-      // 接近配对: 差额 ≤ ¥1 或 ≤ 1%
-      for(let i=0;i<vatItems.length;i++){
-        if(usedVat.has(i)) continue;
-        const v = vatItems[i];
-        for(let j=0;j<voucherItems.length;j++){
-          if(usedVou.has(j)) continue;
-          const w = voucherItems[j];
-          if(w.isSummary) continue;
-          const diff = Math.abs((v.amount||0)-(w.amount||0));
-          const ratio = (v.amount||0)>0 ? diff/(v.amount||0) : 1;
-          if((diff<=1 || ratio<=0.01) && supplierCompat(v.supplier, w.supplier)){
-            nearMatches.push({ vat:v, voucher:w, diff, diffRatio:ratio });
-            usedVat.add(i); usedVou.add(j); break;
-          }
-        }
-      }
-      const onlyVat = vatItems.filter((_,i)=>!usedVat.has(i));
-      const onlyVoucher = voucherItems.filter((_,j)=>!usedVou.has(j));
-      return { matched, nearMatches, onlyVat, onlyVoucher };
-    }
     function xsRecollect(){
       // 主路径: 列宽表分析 + 角色聚合。同时保留旧的 row 采集供明细预览使用。
       XS.rows = [];
@@ -3230,16 +3050,13 @@
           if(s.disabled) continue;
           // 列宽表分析
           const wide = xsAnalyzeWideSheet({ name:s.name, aoa:s.aoa, _book:book.fileName });
-          const aggregated = xsAggregateRoles(wide, { name:s.name, _book:book.fileName, docType:s.docType });
+          const aggregated = xsAggregateRoles(wide, { name:s.name, _book:book.fileName });
           s.wide = wide;
           s.wideRoles = aggregated.roles;
           s.wideGaps = aggregated.gaps;
           s.wideSkipped = aggregated.skipped;
           s.wideDetailRows = aggregated.detailRows;
           s.wideSupplier = aggregated.supplier;
-          s._lineItems = aggregated.lineItems || [];
-          s._headerConfidence = aggregated.headerConfidence;
-          s._headerCandidates = aggregated.headerCandidates;
           // 同时保留 row-级采集 (仅用于明细预览)——不再影响核对
           const r = xsRowsFromSheet({ name:s.name, aoa:s.aoa, _book:book.fileName }, s.docType);
           s.headerRow = wide.headerRow; s.rows = r.rows; s.total = r.total; s.mapping = r.mapping; s.headers = r.headers;
@@ -3326,58 +3143,6 @@
         matching.unitNote = `发票列单位=${vatCmp.mul===1e4?'万元':vatCmp.mul===1e3?'千元':'元'}，凭证列单位=${vouCmp.mul===1e4?'万元':vouCmp.mul===1e3?'千元':'元'}，已自动归一到元后核对。`;
       }
       matching.detailRows = agg.sheetsAnalyzed.reduce((a,x)=>a+x.wide.rowCount,0);
-      // #1: 跨 sheet 汇总 lineItems + bySupplier
-      const allLineItems = { vat:[], voucher:[], inout:[] };
-      for(const book of XS.books){
-        for(const s of book.sheets){
-          if(s.disabled || !s._lineItems) continue;
-          for(const li of s._lineItems){
-            if(allLineItems[li.kind]) allLineItems[li.kind].push(li);
-          }
-        }
-      }
-      matching.lineItems = allLineItems;
-      // 按供应商分组三向汇总
-      // 智能处理: 若 voucher/inout 的 supplier='(未指定)'，且整体只有 1 个真实 vat supplier，则归并到该 supplier
-      const realVatSuppliers = [...new Set(allLineItems.vat.filter(l=>l.supplier!=='(未指定)').map(l=>l.supplier.trim()))];
-      const singleVatSup = realVatSuppliers.length===1 ? realVatSuppliers[0] : null;
-      const resolveSupplier = (li) => {
-        const s = li.supplier.trim();
-        if(s && s!=='(未指定)') return s;
-        // (未指定) → 若只有一个 vat 供应商则归并
-        return singleVatSup || '(未指定)';
-      };
-      const supplierMap = {};
-      for(const li of allLineItems.vat){
-        const k = resolveSupplier(li);
-        if(!supplierMap[k]) supplierMap[k] = { supplier:k, vatTotal:0, voucherTotal:0, inoutTons:0 };
-        supplierMap[k].vatTotal += li.amount||0;
-      }
-      for(const li of allLineItems.voucher){
-        const k = resolveSupplier(li);
-        if(!supplierMap[k]) supplierMap[k] = { supplier:k, vatTotal:0, voucherTotal:0, inoutTons:0 };
-        supplierMap[k].voucherTotal += li.amount||0;
-      }
-      for(const li of allLineItems.inout){
-        const k = resolveSupplier(li);
-        if(!supplierMap[k]) supplierMap[k] = { supplier:k, vatTotal:0, voucherTotal:0, inoutTons:0 };
-        supplierMap[k].inoutTons += li.tons||0;
-      }
-      matching.bySupplier = Object.values(supplierMap).map(row=>{
-        const amtDiff = row.vatTotal - row.voucherTotal;
-        const amtPass = Math.abs(Math.round(amtDiff*100)) <= 1;
-        const qtyDiff = row.inoutTons - (row.voucherTons||0);
-        const qtyPass = true;
-        return { ...row, amtDiff, amtPass, qtyDiff, qtyPass };
-      });
-      // 检查是否有供应商列
-      matching.hasSupplierCol = agg.sheetsAnalyzed.some(sa=>(sa.wide.cols||[]).some(c=>c.primaryRole==='supplier'));
-      // #2: 逐行配对
-      if(allLineItems.vat.length>0 && allLineItems.voucher.length>0){
-        matching.pairings = xsBuildPairings(allLineItems.vat, allLineItems.voucher);
-      } else {
-        matching.pairings = null;
-      }
       XS.matching = matching;
       xsRender();
     }
@@ -3425,15 +3190,9 @@
           const vTons = s.virtualTonsCol;
           const virtualChip = vTons ? `<span class="chip virtual-tons" title="原表无「换算吨」列，引擎自动插入于公斤数列后，值=公斤÷1000">换算吨(自动) · ${vTons.values.length}条 · 来自 公斤数÷1000</span>` : '';
           const lblChips = wide.cols.flatMap(c=>c.labels.map(l=>`<span class="chip total" title="列${c.idx+1}·行${l.row+1}">${escapeHtml(l.text)}${l.neighborValue!=null?' · '+xsFmt(l.neighborValue, l.text.includes('公斤')?0:2):''}</span>`)).join('');
-          // #4: 表头置信度只读展示(本轮不启用手动选行交互)
-          const hConf = s._headerConfidence != null ? s._headerConfidence : 50;
-          const confColor = hConf < 70 ? 'var(--color-warning)' : 'var(--color-success)';
-          const hRowNum = (wide.headerRow||0)+1;
-          const manualBtn = '';
-          const manualSel = '';
           card.innerHTML = `
             <div class="s-head">
-              <div class="s-name"><span>${escapeHtml(book.fileName)} · ${escapeHtml(s.name)}</span><span class="src-name">${wide.rowCount} 行明细 · ${usedCols.length} 有效列 / 表头在第 ${hRowNum} 行 · 置信度 <span style="color:${confColor}">${hConf}%</span>${manualBtn}${manualSel}</span></div>
+              <div class="s-name"><span>${book.fileName} · ${s.name}</span><span class="src-name">${wide.rowCount} 行明细 · ${usedCols.length} 有效列 / 表头在第 ${(wide.headerRow||0)+1} 行</span></div>
               <span class="pill brand" style="font-size:.7rem">列宽表分析</span>
             </div>
             <div class="xlsx-detected">${colChips || '<span class="chip">未识别到列</span>'}${virtualChip}${skipChip}</div>
@@ -3504,18 +3263,7 @@
       // 单位说明辅助函数 (提前声明 以便 voucher/vat 都能调用)
       const vatU = m.unitInfos?.vat?.[0];
       const vouU = m.unitInfos?.voucher?.[0];
-      const _unitLabelFor = (mul) => mul===1?'元 (×1)':mul===1e3?'千元 (×1000)':mul===1e4?'万元 (×10000)':mul===1e8?'亿元 (×1e8)':mul===0.001?'公斤 (×0.001)':mul===1e-6?'克 (×1e-6)':'吨 (×1)';
-      const unitTag = (u, sheetName, role) => {
-        if(!u || !u.mul) return '';
-        const isOverridden = u.overridden === true;
-        const mulVal = u.mul || 1;
-        const dispLabel = mulVal!==1 ? (mulVal===1e4?'万元':mulVal===1e3?'千元':mulVal===1e8?'亿元':mulVal===0.001?'公斤':mulVal===1e-6?'克':'吨') : '元';
-        const tagStyle = isOverridden ? 'background:#dbeafe;color:#1e40af;border-color:#93c5fd' : 'background:#fef3c7;color:#92400e;border-color:#fde68a';
-        const tagTitle = isOverridden ? '已手动设置单位' : ('检测到原列单位为'+dispLabel+'，已归一后参与核对');
-        const tagText = (isOverridden?'已手动: ':'识别为: ')+dispLabel+' \u270f';
-        // 只读 chip(人工覆盖单位交互这一轮不启用 — 避免嵌套引号问题)
-        return '<span class="badge-auto unit-tag-chip" style="'+tagStyle+'" title="'+tagTitle+'">'+tagText.replace(' \u270f','')+'</span>';
-      };
+      const unitTag = (u) => (u && u.mul && u.mul!==1) ? `<span class="badge-auto" style="background:#fef3c7;color:#92400e;border-color:#fde68a" title="检测到原列单位为${u.mul===1e4?'万元':u.mul===1e3?'千元':u.mul===1e8?'亿元':'?'}，已归一到元后参与核对">×${u.mul===1e4?'万':u.mul===1e3?'千':u.mul===1e8?'亿':u.mul}</span>` : '';
       xsumVat.textContent = m.vatTotal!=null ? '¥'+xsFmt(m.vatTotal) : '—';
       xsumInout.textContent = m.inoutTotal!=null ? xsFmt(m.inoutTotal,3) : '—';
       // 凭证金额: 无凭证时 stat 全体软化 (避免 ¥0.00 噪点)
@@ -3523,8 +3271,7 @@
         xsumVoucher.textContent = '¥'+xsFmt(m.voucherAmt);
         xsumVoucher.classList.remove('muted');
         xsumVoucherStat.style.opacity = '';
-        const vouSheetName = (m.unitInfos&&m.unitInfos.voucher&&m.unitInfos.voucher[0])?m.unitInfos.voucher[0].sheet:'';
-      xsumVoucherBadge.innerHTML = unitTag(vouU, vouSheetName, 'voucher');
+        xsumVoucherBadge.innerHTML = unitTag(vouU);
       } else {
         xsumVoucher.textContent = '等待补充';
         xsumVoucher.classList.add('muted');
@@ -3540,8 +3287,7 @@
       }
       xsumPrice.textContent = price!=null ? '¥'+xsFmt(price,2) : '—';
       // 徽章: 自动汇总 vs 原表
-      const vatSheetName = (m.unitInfos&&m.unitInfos.vat&&m.unitInfos.vat[0])?m.unitInfos.vat[0].sheet:'';
-      xsumVatBadge.innerHTML = (m.vatTotal!=null) ? ((m.vatAutoSummary ? '<span class="badge-auto" title="原表无合计行/总计标签，由引擎自动 SUM 得出">自动汇总</span>' : '<span class="badge-orig" title="从原表合计行读出">原表合计</span>') + unitTag(vatU, vatSheetName, 'vat')) : '';
+      xsumVatBadge.innerHTML = (m.vatTotal!=null) ? ((m.vatAutoSummary ? '<span class="badge-auto" title="原表无合计行/总计标签，由引擎自动 SUM 得出">自动汇总</span>' : '<span class="badge-orig" title="从原表合计行读出">原表合计</span>') + unitTag(vatU)) : '';
       xsumInoutBadge.innerHTML = (m.inoutTotal!=null) ? (m.inoutAutoSummary ? '<span class="badge-auto" title="原表无合计吨数，由引擎自动从公斤列 SUM/1000">自动汇总</span>' : '<span class="badge-orig">原表合计</span>') : '';
       xsumPriceBadge.innerHTML = (price!=null) ? (m.avgPriceAutoSummary ? '<span class="badge-auto" title="原表无平均单价列，由发票总计÷入库吨数自动计算">自动计算</span>' : '<span class="badge-orig">原表读出</span>') : '';
       // 单位说明提示条
@@ -3552,8 +3298,6 @@
       if(m.unitWarnings && m.unitWarnings.length){
         for(const w of m.unitWarnings){ notes.push(`⚠ ${w.sheet} · ${w.dim==='weight'?'重量':w.dim==='amount'?'金额':'其他'}: ${w.reason||'单位不可靠'}`); }
       }
-      const overrideCount = Object.keys(XS.unitOverrides||{}).length;
-      if(overrideCount > 0) notes.push(`<span style="color:#1d4ed8">已有 ${overrideCount} 列被人工设置单位</span>`);
       if(notes.length){ unitNoteEl.style.display='block'; unitNoteEl.innerHTML = '<strong>单位归一说明</strong><br>' + notes.join('<br>'); }
 
       if(m.amtMatch){
@@ -3604,91 +3348,6 @@
             <div class="mc-h"><h4>已跳过 · 全空列 (不参与核对)</h4><span class="pill">${m.skippedCols.length} 列</span></div>
             <div class="xlsx-detected">${items}</div>
           </div>`);
-      }
-      // #1: 按供应商核对面板
-      const bySupPanel = $('xlsxBySupplierPanel');
-      if(bySupPanel){
-        bySupPanel.innerHTML = '';
-        const bs = m && m.bySupplier;
-        const hasSupCol = m && m.hasSupplierCol;
-        const shouldShow = bs && hasSupCol && (bs.length >= 1);
-        if(shouldShow){
-          bySupPanel.style.display='block';
-          const anyFail = bs.some(r=>!r.amtPass||!r.qtyPass);
-          let html = `<div class="match-card" id="bySupCard"><div class="mc-h"><h4>按供应商核对</h4><span class="pill ${anyFail?'bad':'good'}"><span class="dot"></span>${anyFail?'存在差异':'全部通过'}</span></div>`;
-          html += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.82rem">';
-          html += '<thead><tr style="background:var(--color-surface-2)"><th style="padding:.4rem .6rem;text-align:left;border-bottom:1px solid var(--color-border)">供应商</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">发票合计</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">凭证合计</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">入库吨数</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">金额差额</th><th style="padding:.4rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">重量差额</th><th style="padding:.4rem .6rem;text-align:center;border-bottom:1px solid var(--color-border)">状态</th></tr></thead><tbody>';
-          for(const row of bs){
-            const failAmt = !row.amtPass;
-            const rowStyle = (failAmt||!row.qtyPass) ? 'background:#fef2f2' : '';
-            html += `<tr style="${rowStyle}">`;
-            html += `<td style="padding:.35rem .6rem;border-bottom:1px solid var(--color-border)">${escapeHtml(row.supplier)}</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">¥${xsFmt(row.vatTotal)}</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">${row.voucherTotal?'¥'+xsFmt(row.voucherTotal):'—'}</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">${row.inoutTons?xsFmt(row.inoutTons,3)+' t':'—'}</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border);${failAmt?'color:#dc2626;font-weight:600':''}">¥${xsFmt(row.amtDiff)}</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:right;border-bottom:1px solid var(--color-border)">—</td>`;
-            html += `<td style="padding:.35rem .6rem;text-align:center;border-bottom:1px solid var(--color-border)"><span class="pill ${(failAmt||!row.qtyPass)?'bad':'good'}" style="font-size:.65rem"><span class="dot"></span>${(failAmt||!row.qtyPass)?'差异':'通过'}</span></td>`;
-            html += '</tr>';
-          }
-          html += '</tbody></table></div></div>';
-          bySupPanel.innerHTML = html;
-        } else {
-          bySupPanel.style.display = 'none';
-        }
-      }
-      // #2: 逐行配对建议面板
-      const pairPanel = $('xlsxPairingsPanel');
-      if(pairPanel){
-        pairPanel.innerHTML='';
-        const pr = m && m.pairings;
-        if(pr){
-          pairPanel.style.display='block';
-          const fmtItem = (li, kind) => {
-            if(!li) return '';
-            const amtStr = li.amount!=null ? '¥'+xsFmt(li.amount) : (li.tons!=null ? xsFmt(li.tons,3)+'t' : '—');
-            const supStr = escapeHtml(li.supplier||'');
-            const dtStr = escapeHtml(String(li.date||'').substring(0,10));
-            const srcStr = escapeHtml(li.sheetName||'')+(li.rowIdx>=0?' 第'+(li.rowIdx+1)+'行':'(汇总)');
-            return `<div style="padding:.25rem .4rem;border-radius:4px;background:var(--color-surface-2);margin:.2rem 0;font-size:.78rem">${supStr?`<b>${supStr}</b> · `:''}${dtStr?dtStr+' · ':''}${amtStr} <span style="opacity:.55;font-size:.7rem">来自 ${srcStr}</span></div>`;
-          };
-          let html = '<div class="match-card"><div class="mc-h"><h4>逐行配对建议</h4><span class="pill brand" style="font-size:.7rem">发票 ↔ 凭证</span></div>';
-          // matched
-          if(pr.matched.length>0){
-            html += `<div style="margin-top:.5rem"><div style="font-size:.78rem;font-weight:600;color:var(--color-success);margin-bottom:.3rem">✓ 已配对 (${pr.matched.length}条)</div>`;
-            const showN = 5;
-            const rows = pr.matched.map(p=>`<div style="display:flex;gap:.4rem;align-items:flex-start">${fmtItem(p.vat,'vat')}<span style="opacity:.4;padding:.25rem 0">↔</span>${fmtItem(p.voucher,'voucher')}</div>`);
-            if(rows.length > showN){
-              html += `<div id="paired-list-short">${rows.slice(0,showN).join('')}<button onclick="document.getElementById('paired-list-short').style.display='none';document.getElementById('paired-list-full').style.display='block'" style="margin-top:.3rem;font-size:.72rem;cursor:pointer;background:none;border:1px solid var(--color-border);border-radius:4px;padding:.15rem .5rem">展开全部 (${rows.length}条)</button></div>`;
-              html += `<div id="paired-list-full" style="display:none">${rows.join('')}</div>`;
-            } else {
-              html += rows.join('');
-            }
-            html += '</div>';
-          }
-          // nearMatches
-          if(pr.nearMatches.length>0){
-            html += `<div style="margin-top:.5rem"><div style="font-size:.78rem;font-weight:600;color:var(--color-warning);margin-bottom:.3rem">≈ 接近配对 (${pr.nearMatches.length}条)</div>`;
-            html += pr.nearMatches.map(p=>`<div style="display:flex;gap:.4rem;align-items:flex-start">${fmtItem(p.vat,'vat')}<span style="opacity:.4;padding:.25rem 0">≈</span>${fmtItem(p.voucher,'voucher')}<span style="font-size:.7rem;color:var(--color-warning);padding:.25rem 0">差¥${xsFmt(p.diff)}</span></div>`).join('');
-            html += '</div>';
-          }
-          // onlyVat
-          if(pr.onlyVat.length>0){
-            html += `<div style="margin-top:.5rem"><div style="font-size:.78rem;font-weight:600;color:#94a3b8;margin-bottom:.3rem">仅发票 · 无凭证匹配 (${pr.onlyVat.length}条)</div>`;
-            html += pr.onlyVat.map(li=>fmtItem(li,'vat')).join('');
-            html += '</div>';
-          }
-          // onlyVoucher
-          if(pr.onlyVoucher.length>0){
-            html += `<div style="margin-top:.5rem"><div style="font-size:.78rem;font-weight:600;color:#94a3b8;margin-bottom:.3rem">仅凭证 · 无发票匹配 (${pr.onlyVoucher.length}条)</div>`;
-            html += pr.onlyVoucher.map(li=>fmtItem(li,'voucher')).join('');
-            html += '</div>';
-          }
-          html += '</div>';
-          pairPanel.innerHTML = html;
-        } else {
-          pairPanel.style.display = 'none';
-        }
       }
       xsRenderPreview();
     }
@@ -3833,7 +3492,7 @@
     updateKPIs(); renderQueue(); renderResultTable(); buildExportColumnsUI();
     xsRender();
     // 调试钩子:仅供本地端到端测试使用 (在生产环境亦不会造成安全问题)
-    window.__app = { state, recomputeMatching, normalizeWeight, exportXlsx, renderResultTable, classifyRows, XS, xsHandleFiles, xsLoadDemo, xsRender, xsBuildPairings };
+    window.__app = { state, recomputeMatching, normalizeWeight, exportXlsx, renderResultTable, classifyRows, XS, xsHandleFiles, xsLoadDemo, xsRender };
   </script>
 </body>
 </html>
